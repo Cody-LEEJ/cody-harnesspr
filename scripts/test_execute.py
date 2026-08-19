@@ -280,6 +280,17 @@ class TestBuildPreamble:
         result = executor._build_preamble("", "")
         assert "/phases/0-mvp/index.json" in result
 
+    def test_ac_commands_listed_when_declared(self, executor):
+        result = executor._build_preamble("", "", ac=["npm run build", "npm test"])
+        assert "- `npm run build`" in result
+        assert "- `npm test`" in result
+        assert "독립 실행" in result
+
+    def test_generic_ac_rule_when_not_declared(self, executor):
+        result = executor._build_preamble("", "")
+        assert "AC(Acceptance Criteria) 검증을 직접 실행하라" in result
+        assert "독립 실행" not in result
+
 
 # ---------------------------------------------------------------------------
 # _update_top_index
@@ -540,6 +551,129 @@ class TestParseClaudeOutput:
 
     def test_json_array_returns_none(self):
         assert ex.StepExecutor._parse_claude_output("[1,2]") is None
+
+
+# ---------------------------------------------------------------------------
+# _run_ac — executor가 AC를 직접 실행
+# ---------------------------------------------------------------------------
+
+class TestRunAc:
+    def test_all_pass_returns_none(self, executor):
+        assert executor._run_ac(2, ["true", "echo ok"]) is None
+
+    def test_first_failure_returns_error_with_cmd(self, executor):
+        err = executor._run_ac(2, ["true", "echo boom >&2; exit 3", "true"])
+        assert err is not None
+        assert "exit 3" in err
+        assert "boom" in err
+        assert "echo boom" in err
+
+    def test_stops_at_first_failure(self, executor, tmp_project):
+        marker = tmp_project / "ran"
+        executor._run_ac(2, ["false", f"touch {marker}"])
+        assert not marker.exists()
+
+    def test_runs_in_root(self, executor, tmp_project):
+        assert executor._run_ac(2, ["test -f CLAUDE.md"]) is None
+
+    def test_emits_ac_result_per_command(self, executor):
+        executor._run_ac(2, ["true", "false"])
+        events = [json.loads(l) for l in executor._events_file.read_text().splitlines()]
+        ac = [e for e in events if e["event"] == "ac_result"]
+        assert [e["exit_code"] for e in ac] == [0, 1]
+        assert ac[0]["cmd"] == "true"
+
+    def test_timeout_is_failure(self, executor):
+        executor.AC_TIMEOUT = 1
+        err = executor._run_ac(2, ["sleep 5"])
+        assert err is not None and "timeout" in err
+
+
+# ---------------------------------------------------------------------------
+# _execute_single_step 판정 — AC 결과가 세션 자기 신고보다 우선
+# ---------------------------------------------------------------------------
+
+class TestVerdict:
+    """_invoke_claude를 '세션이 index.json에 status를 쓰는' 가짜로 바꿔 판정 로직만 검증."""
+
+    def _fake_session(self, executor, status, **extra):
+        calls = []
+        def fake_invoke(step, preamble):
+            calls.append(preamble)
+            idx = executor._read_json(executor._index_file)
+            for s in idx["steps"]:
+                if s["step"] == step["step"]:
+                    s["status"] = status
+                    s.update(extra)
+            executor._write_json(executor._index_file, idx)
+            return {}
+        executor._invoke_claude = fake_invoke
+        executor._commit_step = lambda *a: None
+        executor._update_top_index = lambda *a: None
+        return calls
+
+    def _status(self, executor, n=2):
+        return next(s for s in executor._read_json(executor._index_file)["steps"] if s["step"] == n)
+
+    def test_ac_pass_and_session_completed(self, executor):
+        self._fake_session(executor, "completed", summary="done")
+        assert executor._execute_single_step({"step": 2, "name": "ui", "ac": ["true"]}) is True
+        assert self._status(executor)["status"] == "completed"
+
+    def test_ac_pass_overrides_session_error(self, executor, capsys):
+        self._fake_session(executor, "error", error_message="i gave up")
+        assert executor._execute_single_step({"step": 2, "name": "ui", "ac": ["true"]}) is True
+        st = self._status(executor)
+        assert st["status"] == "completed"
+        assert "error_message" not in st
+        assert "판정 불일치" in capsys.readouterr().out
+
+    def test_ac_fail_overrides_session_completed_and_feeds_error_back(self, executor):
+        calls = self._fake_session(executor, "completed", summary="lie")
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui", "ac": ["echo nope >&2; exit 1"]})
+        assert e.value.code == 1
+        assert len(calls) == ex.StepExecutor.MAX_RETRIES
+        # 2회차부터는 AC 출력이 prev_error로 프롬프트에 들어간다
+        assert "이전 시도 실패" in calls[1] and "nope" in calls[1]
+        st = self._status(executor)
+        assert st["status"] == "error"
+        assert "AC 실패" in st["error_message"]
+
+    def test_no_ac_trusts_session_completed(self, executor, capsys):
+        self._fake_session(executor, "completed", summary="ok")
+        assert executor._execute_single_step({"step": 2, "name": "ui"}) is True
+        assert "AC 미선언" in capsys.readouterr().out
+
+    def test_no_ac_session_error_retries_then_fails(self, executor):
+        calls = self._fake_session(executor, "error", error_message="boom")
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui"})
+        assert e.value.code == 1
+        assert len(calls) == ex.StepExecutor.MAX_RETRIES
+
+    def test_blocked_stops_before_ac(self, executor, tmp_project):
+        self._fake_session(executor, "blocked", blocked_reason="need API key")
+        marker = tmp_project / "ac-ran"
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui", "ac": [f"touch {marker}"]})
+        assert e.value.code == 2
+        assert not marker.exists()
+
+    def test_ac_taken_from_step_dict_not_index(self, executor):
+        """세션이 index.json에서 ac를 지워도 executor는 호출 전 step dict의 ac로 판정한다."""
+        def fake_invoke(step, preamble):
+            idx = executor._read_json(executor._index_file)
+            for s in idx["steps"]:
+                if s["step"] == 2:
+                    s["status"] = "completed"
+                    s.pop("ac", None)
+            executor._write_json(executor._index_file, idx)
+        executor._invoke_claude = fake_invoke
+        executor._commit_step = lambda *a: None
+        executor._update_top_index = lambda *a: None
+        with pytest.raises(SystemExit):
+            executor._execute_single_step({"step": 2, "name": "ui", "ac": ["false"]})
 
 
 # ---------------------------------------------------------------------------

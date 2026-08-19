@@ -54,6 +54,7 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    AC_TIMEOUT = 600  # AC 커맨드 1개당 최대 실행 시간(초)
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
@@ -213,7 +214,7 @@ class StepExecutor:
         return "## 이전 Step 산출물\n\n" + "\n".join(lines) + "\n\n"
 
     def _build_preamble(self, guardrails: str, step_context: str,
-                        prev_error: Optional[str] = None) -> str:
+                        prev_error: Optional[str] = None, ac: Optional[list] = None) -> str:
         commit_example = self.FEAT_MSG.format(
             phase=self._phase_name, num="N", name="<step-name>"
         )
@@ -223,6 +224,14 @@ class StepExecutor:
                 f"\n## ⚠ 이전 시도 실패 — 아래 에러를 반드시 참고하여 수정하라\n\n"
                 f"{prev_error}\n\n---\n\n"
             )
+        if ac:
+            ac_rule = (
+                "4. 아래 AC 커맨드를 직접 실행해 통과시켜라. "
+                "세션 종료 후 executor가 동일 커맨드를 독립 실행해 통과/실패를 판정한다:\n"
+                + "".join(f"   - `{cmd}`\n" for cmd in ac)
+            )
+        else:
+            ac_rule = "4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
         return (
             f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
             f"{guardrails}\n\n---\n\n"
@@ -231,7 +240,7 @@ class StepExecutor:
             f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
             f"3. 기존 테스트를 깨뜨리지 마라.\n"
-            f"4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
+            f"{ac_rule}"
             f"5. /phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
             f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
@@ -286,6 +295,24 @@ class StepExecutor:
         keys = ("duration_ms", "num_turns", "total_cost_usd", "is_error", "session_id")
         return {k: data[k] for k in keys if k in data}
 
+    # --- AC 독립 실행 ---
+
+    def _run_ac(self, step_num: int, ac: list) -> Optional[str]:
+        """AC 커맨드를 순서대로 executor가 직접 실행한다. 전부 통과하면 None, 첫 실패에서 에러 텍스트."""
+        for cmd in ac:
+            t0 = time.monotonic()
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=self._root, capture_output=True, text=True,
+                                   timeout=self.AC_TIMEOUT)
+                code, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+            except subprocess.TimeoutExpired:
+                code, out = -1, f"timeout after {self.AC_TIMEOUT}s"
+            self._emit("ac_result", step=step_num, cmd=cmd, exit_code=code,
+                       elapsed_ms=int((time.monotonic() - t0) * 1000))
+            if code != 0:
+                return f"AC 실패: `{cmd}` (exit {code})\n{out[-2000:]}"
+        return None
+
     # --- 헤더 & 검증 ---
 
     def _print_header(self):
@@ -330,7 +357,7 @@ class StepExecutor:
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
             step_context = self._build_step_context(index)
-            preamble = self._build_preamble(guardrails, step_context, prev_error)
+            preamble = self._build_preamble(guardrails, step_context, prev_error, ac=step.get("ac"))
 
             tag = f"Step {step_num}/{self._total - 1} ({done} done): {step_name}"
             if attempt > 1:
@@ -341,20 +368,10 @@ class StepExecutor:
                 elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
-            status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+            self_status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
 
-            if status == "completed":
-                for s in index["steps"]:
-                    if s["step"] == step_num:
-                        s["completed_at"] = ts
-                self._write_json(self._index_file, index)
-                self._commit_step(step_num, step_name)
-                self._emit("step_completed", step=step_num, attempt=attempt, elapsed_s=elapsed)
-                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
-                return True
-
-            if status == "blocked":
+            if self_status == "blocked":
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["blocked_at"] = ts
@@ -366,7 +383,41 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
-            err_msg = next(
+            # 판정: AC가 선언돼 있으면 executor가 직접 실행한 결과가 우선한다. 세션의 자기 신고는 보조 신호.
+            # `ac`는 호출 전에 읽은 step dict에서 가져온다 — 세션이 index.json을 고쳐도 영향을 받지 않는다.
+            ac = step.get("ac") or []
+            ac_error = None
+            if ac:
+                ac_error = self._run_ac(step_num, ac)
+                verdict = "completed" if ac_error is None else "failed"
+                self_verdict = "completed" if self_status == "completed" else "failed"
+                self._emit("verdict", step=step_num, attempt=attempt, self_status=self_status,
+                           ac_pass=ac_error is None, final=verdict)
+                if verdict != self_verdict:
+                    print(f"  ! 판정 불일치: 세션 status={self_status}, AC={'pass' if ac_error is None else 'fail'}"
+                          f" → executor 판정({verdict}) 우선")
+                    self._emit("verdict_mismatch", step=step_num, attempt=attempt,
+                               self_status=self_status, ac_pass=ac_error is None)
+            else:
+                if attempt == 1:
+                    print(f"  WARN: step {step_num}에 AC 미선언 — 세션 자기 신고로 판정한다")
+                verdict = "completed" if self_status == "completed" else "failed"
+
+            if verdict == "completed":
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "completed"
+                        s["completed_at"] = ts
+                        s.pop("error_message", None)
+                        if not s.get("summary"):
+                            print(f"  WARN: step {step_num} summary 없음 — 다음 step 컨텍스트에서 빠진다")
+                self._write_json(self._index_file, index)
+                self._commit_step(step_num, step_name)
+                self._emit("step_completed", step=step_num, attempt=attempt, elapsed_s=elapsed)
+                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                return True
+
+            err_msg = ac_error or next(
                 (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
                 "Step did not update status",
             )
