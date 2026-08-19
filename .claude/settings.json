@@ -1,5 +1,14 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(npx:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)"
+    ],
     "deny": [
       "Bash(rm -rf:*)",
       "Bash(git push --force:*)",

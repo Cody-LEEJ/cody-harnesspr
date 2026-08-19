@@ -8,7 +8,8 @@ phase 하나가 끝난 뒤(완료든 실패든) 회고를 기록하라. 목적�
    - `verdict_mismatch` — 세션이 통과라고 했지만 AC가 실패한 경우 (또는 그 반대)
    - `ac_result` 의 `exit_code` — 어떤 AC 커맨드가 자주 깨지는지
    - `claude_done` 의 `num_turns`, `total_cost_usd` — 비정상적으로 비싼 step
-3. `.dev/lessons.md` — 이전 phase들의 기록
+3. `.dev/reviews/*.md` — `/review`가 남긴 결과 표. 어떤 Golden Rule·아키텍처 위반이 반복되는지
+4. `.dev/lessons.md` — 이전 phase들의 기록
 
 ## 할 일
 
