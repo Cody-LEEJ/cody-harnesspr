@@ -84,9 +84,8 @@ class StepExecutor:
         self._print_header()
         self._check_blockers()
         self._checkout_branch()
-        guardrails = self._load_guardrails()
         self._ensure_created_at()
-        self._execute_all_steps(guardrails)
+        self._execute_all_steps()
         self._finalize()
 
     # --- timestamps ---
@@ -174,15 +173,21 @@ class StepExecutor:
 
     # --- guardrails & context ---
 
-    def _load_guardrails(self) -> str:
+    ALWAYS_DOCS = ("CLAUDE.md", "docs/GOLDEN_RULES.md")
+
+    def _load_guardrails(self, step: dict) -> str:
+        """항상 주입: CLAUDE.md + GOLDEN_RULES. 그 외 문서는 step이 `docs`로 선언한 것만."""
         sections = []
-        claude_md = ROOT / "CLAUDE.md"
-        if claude_md.exists():
-            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
-        docs_dir = ROOT / "docs"
-        if docs_dir.is_dir():
-            for doc in sorted(docs_dir.glob("*.md")):
-                sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+        for rel in self.ALWAYS_DOCS:
+            f = ROOT / rel
+            if f.exists():
+                sections.append(f"## 프로젝트 규칙 ({rel})\n\n{f.read_text()}")
+        for rel in step.get("docs", []):
+            f = ROOT / rel
+            if not f.exists():
+                print(f"  WARN: step {step.get('step')}이 선언한 문서가 없음: {rel}")
+                continue
+            sections.append(f"## 참고 문서: {rel}\n\n{f.read_text()}")
         return "\n\n---\n\n".join(sections) if sections else ""
 
     @staticmethod
@@ -290,10 +295,11 @@ class StepExecutor:
 
     # --- 실행 루프 ---
 
-    def _execute_single_step(self, step: dict, guardrails: str) -> bool:
+    def _execute_single_step(self, step: dict) -> bool:
         """단일 step 실행 (재시도 포함). 완료되면 True, 실패/차단이면 False."""
         step_num, step_name = step["step"], step["name"]
         done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
+        guardrails = self._load_guardrails(step)
         prev_error = None
 
         for attempt in range(1, self.MAX_RETRIES + 1):
@@ -361,7 +367,7 @@ class StepExecutor:
 
         return False  # unreachable
 
-    def _execute_all_steps(self, guardrails: str):
+    def _execute_all_steps(self):
         while True:
             index = self._read_json(self._index_file)
             pending = next((s for s in index["steps"] if s["status"] == "pending"), None)
@@ -376,7 +382,7 @@ class StepExecutor:
                     self._write_json(self._index_file, index)
                     break
 
-            self._execute_single_step(pending, guardrails)
+            self._execute_single_step(pending)
 
     def _finalize(self):
         index = self._read_json(self._index_file)

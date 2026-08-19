@@ -146,50 +146,58 @@ class TestJsonHelpers:
 # ---------------------------------------------------------------------------
 
 class TestLoadGuardrails:
-    def test_loads_claude_md_and_docs(self, executor, tmp_project):
+    """항상: CLAUDE.md + docs/GOLDEN_RULES.md. 그 외는 step이 `docs`로 선언한 것만."""
+
+    def test_claude_md_only_when_no_docs_declared(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+            result = executor._load_guardrails({"step": 2})
         assert "# Rules" in result
         assert "rule one" in result
+        assert "# Architecture" not in result
+        assert "# Guide" not in result
+
+    def test_loads_only_declared_docs(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/arch.md"]})
         assert "# Architecture" in result
-        assert "# Guide" in result
+        assert "## 참고 문서: docs/arch.md" in result
+        assert "# Guide" not in result
+
+    def test_golden_rules_always_loaded(self, executor, tmp_project):
+        (tmp_project / "docs" / "GOLDEN_RULES.md").write_text("# Golden\n- never X")
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2})
+        assert "never X" in result
+        assert "docs/GOLDEN_RULES.md" in result
+
+    def test_declared_order_preserved(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/guide.md", "docs/arch.md"]})
+        assert result.index("# Guide") < result.index("# Architecture")
+
+    def test_missing_declared_doc_warns_and_skips(self, executor, tmp_project, capsys):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/nope.md", "docs/arch.md"]})
+        assert "WARN" in capsys.readouterr().out
+        assert "nope" not in result
+        assert "# Architecture" in result
 
     def test_sections_separated_by_divider(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/arch.md"]})
         assert "---" in result
-
-    def test_docs_sorted_alphabetically(self, executor, tmp_project):
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
-        arch_pos = result.index("arch")
-        guide_pos = result.index("guide")
-        assert arch_pos < guide_pos
 
     def test_no_claude_md(self, executor, tmp_project):
         (tmp_project / "CLAUDE.md").unlink()
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/arch.md"]})
         assert "CLAUDE.md" not in result
         assert "Architecture" in result
 
-    def test_no_docs_dir(self, executor, tmp_project):
-        import shutil
-        shutil.rmtree(tmp_project / "docs")
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
-        assert "Rules" in result
-        assert "Architecture" not in result
-
     def test_empty_project(self, tmp_path):
         with patch.object(ex, "ROOT", tmp_path):
-            # executor가 필요 없는 static-like 동작이므로 임시 인스턴스
-            phases_dir = tmp_path / "phases" / "dummy"
-            phases_dir.mkdir(parents=True)
-            idx = {"project": "T", "phase": "t", "steps": []}
-            (phases_dir / "index.json").write_text(json.dumps(idx))
             inst = ex.StepExecutor.__new__(ex.StepExecutor)
-            result = inst._load_guardrails()
+            result = inst._load_guardrails({"step": 0})
         assert result == ""
 
 
