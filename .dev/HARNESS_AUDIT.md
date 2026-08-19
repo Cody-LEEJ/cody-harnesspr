@@ -2,7 +2,10 @@
 
 Agentic Engineering 5 Pillar / Harness Engineering 6축 기준으로 이 리포의 현재 상태를 진단한 문서.
 
-**진단 시점**: 2026-08-16 · 커밋 `da676bc`
+> 이 파일은 **하네스 자신의 기록**이다. 제품 문서(`docs/`)가 아니므로 `.dev/`에 둔다 — `/harness`가 `docs/`를 읽을 때 과거 진단("P0 가드가 동작하지 않는다" 등)을 현재 사실로 오인하지 않게 하기 위함. 사용법은 루트 `HARNESS.md`.
+
+**1차 진단**: 2026-08-16 · 커밋 `da676bc` → 아래 "요약"부터의 본문. 고쳐진 항목도 이력으로 그대로 둔다.
+**2차 진단**: 2026-08-19 · 1차 수정 8커밋 후 → 바로 아래 "2차 진단" 섹션.
 **전제 (수정됨 2026-08-19)**: 이 리포는 **clone해서 그 안에 제품을 만드는 템플릿**이다. 루트 `CLAUDE.md`·`docs/`는 제품의 것이고, `scripts/`·`.claude/`는 프레임워크 자신의 것이다. 진단 당시 전제("제품 코드는 여기 들어오지 않는다")는 사용자 확인으로 폐기했고, 그에 따라 로드맵 2(`templates/` 분리)는 다른 방식으로 해소했다.
 
 범례: ● 충족 · ◐ 부분 · ✗ 없음
@@ -24,6 +27,53 @@ Agentic Engineering 5 Pillar / Harness Engineering 6축 기준으로 이 리포�
 | 5-1 | git remote 재배선 | ✓ | — | origin → `Cody-LEEJ/cody-harnesspr`, upstream → `jha0313/harness_framework`. push는 사용자가 |
 
 여전히 비어 있는 것 (의도적): 독립 리뷰 세션(`--review`, 모델 분리), worktree, LogQL Layer 2, MCP, 시각 검증. "지금 하지 말 것" 표 참조.
+
+---
+
+## 2차 진단 (2026-08-19, 1차 수정 후 재검토)
+
+리포 전체(~2,400줄)를 다시 읽고 5 Pillar + 6축에 대조했다.
+
+한 줄: **1차 로드맵 8개 중 7개가 코드·테스트로 이행됐고, 남은 갭은 대부분 의도적 보류다. 보류가 아닌데 빠진 것 4개와, 1차 수정이 만든 새 오염 1개를 찾았다. 실행기(`execute.py`) 자체의 결함은 없다.**
+
+범례: ● 충족 · ◐ 부분 · ✗ 없음 · ⏸ 의도적 보류(사용자 결정)
+
+| 축 | 1차 | 2차 | 남은 것 |
+|---|---|---|---|
+| Pillar 1 Context | ◐ | ● | `.dev/lessons.md`를 계획 단계가 안 읽음 (N-2) |
+| Pillar 2 Validation | ◐ | ◐ | Layer 1 ●, self-correction ●. 독립 리뷰/모델 분리 ⏸, LogQL ⏸, 시각 ⏸ |
+| Pillar 3 Tooling | ◐ | ● | `/review`·`/retro`가 수동 호출 — `--review` ⏸와 묶임 |
+| Pillar 4 Codebases | ✗ | ◐ | 스택 오염 해소 ●, 로깅 ●, Golden Rules ●. 새 오염: 이 문서가 `docs/`에 있었음 (N-1) |
+| Pillar 5 Compound | ◐ | ◐ | 그래프 간선 2개 누락 (N-2, N-3). origin 미push |
+| §2 구조 | ◐ | ◐ | 권한 경계: deny만 있고 allow 없음 (N-4) |
+| §3 맥락 | ✗ | ● | paths 조건부 로딩 없음 (N-5) |
+| §4 계획 | ● | ● | — |
+| §5 실행 | ◐ | ● | Ralph ●. Auto Research ✗ (필요 없음) |
+| §6 검증 | ✗ | ◐ | 안전장치: gate ● dry-run ● worktree ⏸ |
+| §7 개선 | ✗ | ● | retro + 승격 + 제거 제안 전부 있음. 실전 0회라 미검증 |
+
+### 1차 수정 중 확인된 것
+
+- AC 독립 게이트: `execute.py` `_execute_single_step` — `ac`를 호출 전 step dict에서 읽어 세션의 index.json 조작에 면역. 불일치 시 `verdict_mismatch` 이벤트. `TestVerdict` 7건.
+- 선택 주입: `ALWAYS_DOCS` + `step.docs`. `TestLoadGuardrails` 8건.
+- hook: stdin+jq, deny JSON. `test_hooks.py`에서 차단/허용 모두 검증.
+- 그래프 간선: execute.py→GOLDEN_RULES, review→GOLDEN_RULES, retro→lessons→GOLDEN_RULES, harness→review→retro.
+
+### 새로 발견한 것 (전부 2차에서 수정)
+
+| # | 발견 | 왜 문제인가 | 수정 |
+|---|------|-----------|------|
+| N-1 | 이 감사문서가 `docs/`에 있었다 | clone 모델에서 `docs/`는 제품의 것. `/harness` A절이 읽으면 "P0 가드 무효" 같은 **고쳐진 과거**를 현재로 오인. Pillar 4 오염 + Pillar 1 거짓 신호 | `.dev/HARNESS_AUDIT.md`로 이동 |
+| N-2 | `/retro`가 쓴 `lessons.md`를 아무도 안 읽음 | lessons → 다음 phase 설계로 가는 간선이 없으면 §7 "3번 반복"은 카운트만 되고 예방이 안 됨 | `harness.md` A절에 lessons.md 읽기 추가 |
+| N-3 | `/review` 결과가 휘발 | "이전 리뷰에서도 같은 위반?"을 판단할 기록이 없음 | `.dev/reviews/{날짜}-{브랜치}.md`에 저장, `/retro` 입력에 추가 |
+| N-4 | permissions에 deny 4개뿐 | 인터랙티브 세션에서 안전 커맨드마다 프롬프트 = friction. §2 권한 경계는 allow+deny | `settings.json` allow 7개 (npm run, npx, pytest, git status/diff/log/branch) |
+| N-5 | `.claude/rules/` paths 조건부 로딩 없음 | `execute.py` 경로는 `docs` 선언으로 풀리지만 인터랙티브에서 UI 파일 만질 때 UI_GUIDE가 자동으로 안 뜸 (§3b) | `.claude/rules/ui.md` — `src/components/**`, `src/app/**/*.tsx` 건드릴 때만 로드 |
+
+### 다음 라운드
+
+여전히 ⏸: `--review` 독립 리뷰 세션/모델 분리, worktree, LogQL Layer 2, MCP, 시각 검증.
+
+**1순위는 `--review`.** phase가 끝난 뒤 사람이 `/review`·`/retro`를 기억해서 쳐야 하는 것이 남은 가장 큰 수동 병목(Pillar 3)이고, 이걸 `execute.py --review`(별도 `claude -p`, 가능하면 다른 모델)로 codify하면 Pillar 2의 모델 분리(§6.1)까지 같이 풀린다. 단, **첫 phase를 한 번 실전으로 돌린 뒤** 결정한다 — worktree와 같은 이유.
 
 ---
 

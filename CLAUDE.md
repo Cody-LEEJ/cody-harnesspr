@@ -16,6 +16,7 @@
 - `docs/ARCHITECTURE.md` — 디렉토리 구조와 데이터 흐름
 - `docs/ADR.md` — 기술 결정 인덱스 (개별 결정은 `docs/decisions/`)
 - `docs/UI_GUIDE.md` — UI 규칙 (UI step에서만 필요)
+- `HARNESS.md` — 하네스 사용법. 프레임워크 문서이며 제품 규칙이 아니다 (step `docs`에 넣지 않는다)
 
 step별로 필요한 문서만 `phases/{task}/index.json`의 `docs` 필드에 선언한다. 전부 넣지 않는다.
 
