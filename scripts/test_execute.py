@@ -86,6 +86,7 @@ def executor(tmp_project, phase_dir):
     inst._phase_dir_name = "0-mvp"
     inst._index_file = phase_dir / "index.json"
     inst._top_index_file = tmp_project / "phases" / "index.json"
+    inst._events_file = tmp_project / ".dev" / "runs" / "0-mvp" / "events.jsonl"
     return inst
 
 
@@ -146,50 +147,58 @@ class TestJsonHelpers:
 # ---------------------------------------------------------------------------
 
 class TestLoadGuardrails:
-    def test_loads_claude_md_and_docs(self, executor, tmp_project):
+    """항상: CLAUDE.md + docs/GOLDEN_RULES.md. 그 외는 step이 `docs`로 선언한 것만."""
+
+    def test_claude_md_only_when_no_docs_declared(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+            result = executor._load_guardrails({"step": 2})
         assert "# Rules" in result
         assert "rule one" in result
+        assert "# Architecture" not in result
+        assert "# Guide" not in result
+
+    def test_loads_only_declared_docs(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/arch.md"]})
         assert "# Architecture" in result
-        assert "# Guide" in result
+        assert "## 참고 문서: docs/arch.md" in result
+        assert "# Guide" not in result
+
+    def test_golden_rules_always_loaded(self, executor, tmp_project):
+        (tmp_project / "docs" / "GOLDEN_RULES.md").write_text("# Golden\n- never X")
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2})
+        assert "never X" in result
+        assert "docs/GOLDEN_RULES.md" in result
+
+    def test_declared_order_preserved(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/guide.md", "docs/arch.md"]})
+        assert result.index("# Guide") < result.index("# Architecture")
+
+    def test_missing_declared_doc_warns_and_skips(self, executor, tmp_project, capsys):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/nope.md", "docs/arch.md"]})
+        assert "WARN" in capsys.readouterr().out
+        assert "nope" not in result
+        assert "# Architecture" in result
 
     def test_sections_separated_by_divider(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/arch.md"]})
         assert "---" in result
-
-    def test_docs_sorted_alphabetically(self, executor, tmp_project):
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
-        arch_pos = result.index("arch")
-        guide_pos = result.index("guide")
-        assert arch_pos < guide_pos
 
     def test_no_claude_md(self, executor, tmp_project):
         (tmp_project / "CLAUDE.md").unlink()
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+            result = executor._load_guardrails({"step": 2, "docs": ["docs/arch.md"]})
         assert "CLAUDE.md" not in result
         assert "Architecture" in result
 
-    def test_no_docs_dir(self, executor, tmp_project):
-        import shutil
-        shutil.rmtree(tmp_project / "docs")
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
-        assert "Rules" in result
-        assert "Architecture" not in result
-
     def test_empty_project(self, tmp_path):
         with patch.object(ex, "ROOT", tmp_path):
-            # executor가 필요 없는 static-like 동작이므로 임시 인스턴스
-            phases_dir = tmp_path / "phases" / "dummy"
-            phases_dir.mkdir(parents=True)
-            idx = {"project": "T", "phase": "t", "steps": []}
-            (phases_dir / "index.json").write_text(json.dumps(idx))
             inst = ex.StepExecutor.__new__(ex.StepExecutor)
-            result = inst._load_guardrails()
+            result = inst._load_guardrails({"step": 0})
         assert result == ""
 
 
@@ -270,6 +279,17 @@ class TestBuildPreamble:
     def test_includes_index_path(self, executor):
         result = executor._build_preamble("", "")
         assert "/phases/0-mvp/index.json" in result
+
+    def test_ac_commands_listed_when_declared(self, executor):
+        result = executor._build_preamble("", "", ac=["npm run build", "npm test"])
+        assert "- `npm run build`" in result
+        assert "- `npm test`" in result
+        assert "독립 실행" in result
+
+    def test_generic_ac_rule_when_not_declared(self, executor):
+        result = executor._build_preamble("", "")
+        assert "AC(Acceptance Criteria) 검증을 직접 실행하라" in result
+        assert "독립 실행" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +490,192 @@ class TestInvokeClaude:
         assert mock_run.call_args[1]["timeout"] == 1800
 
 
+    def test_saves_parsed_fields_from_json_stdout(self, executor):
+        stdout = json.dumps({"type": "result", "duration_ms": 1234, "num_turns": 5,
+                             "total_cost_usd": 0.12, "is_error": False, "session_id": "abc",
+                             "result": "done"})
+        mock_result = MagicMock(returncode=0, stdout=stdout, stderr="")
+        with patch("subprocess.run", return_value=mock_result):
+            output = executor._invoke_claude({"step": 2, "name": "ui"}, "p")
+        assert output["parsed"] == {"duration_ms": 1234, "num_turns": 5, "total_cost_usd": 0.12,
+                                    "is_error": False, "session_id": "abc"}
+        assert output["stdout"] == stdout  # 원문 유지
+
+    def test_parsed_is_none_for_non_json(self, executor):
+        mock_result = MagicMock(returncode=1, stdout="not json at all", stderr="")
+        with patch("subprocess.run", return_value=mock_result):
+            output = executor._invoke_claude({"step": 2, "name": "ui"}, "p")
+        assert output["parsed"] is None
+
+    def test_emits_claude_done_event(self, executor):
+        mock_result = MagicMock(returncode=0, stdout='{"num_turns": 3}', stderr="")
+        with patch("subprocess.run", return_value=mock_result):
+            executor._invoke_claude({"step": 2, "name": "ui"}, "p")
+        events = [json.loads(l) for l in executor._events_file.read_text().splitlines()]
+        assert events[-1]["event"] == "claude_done"
+        assert events[-1]["step"] == 2
+        assert events[-1]["num_turns"] == 3
+
+
+# ---------------------------------------------------------------------------
+# _emit / _parse_claude_output
+# ---------------------------------------------------------------------------
+
+class TestEmit:
+    def test_appends_valid_json_lines(self, executor):
+        executor._emit("a", step=1)
+        executor._emit("b", step=2, error="x")
+        lines = executor._events_file.read_text().splitlines()
+        assert len(lines) == 2
+        a, b = (json.loads(l) for l in lines)
+        assert a["event"] == "a" and a["step"] == 1 and a["phase"] == "mvp" and "ts" in a
+        assert b["event"] == "b" and b["error"] == "x"
+
+    def test_creates_parent_dirs(self, executor):
+        assert not executor._events_file.parent.exists()
+        executor._emit("x")
+        assert executor._events_file.exists()
+
+    def test_korean_not_escaped(self, executor):
+        executor._emit("x", error="한글")
+        assert "한글" in executor._events_file.read_text()
+
+
+class TestParseClaudeOutput:
+    def test_extracts_known_keys_only(self):
+        out = ex.StepExecutor._parse_claude_output('{"duration_ms": 1, "result": "long text", "extra": 1}')
+        assert out == {"duration_ms": 1}
+
+    def test_non_json_returns_none(self):
+        assert ex.StepExecutor._parse_claude_output("oops") is None
+
+    def test_json_array_returns_none(self):
+        assert ex.StepExecutor._parse_claude_output("[1,2]") is None
+
+
+# ---------------------------------------------------------------------------
+# _run_ac — executor가 AC를 직접 실행
+# ---------------------------------------------------------------------------
+
+class TestRunAc:
+    def test_all_pass_returns_none(self, executor):
+        assert executor._run_ac(2, ["true", "echo ok"]) is None
+
+    def test_first_failure_returns_error_with_cmd(self, executor):
+        err = executor._run_ac(2, ["true", "echo boom >&2; exit 3", "true"])
+        assert err is not None
+        assert "exit 3" in err
+        assert "boom" in err
+        assert "echo boom" in err
+
+    def test_stops_at_first_failure(self, executor, tmp_project):
+        marker = tmp_project / "ran"
+        executor._run_ac(2, ["false", f"touch {marker}"])
+        assert not marker.exists()
+
+    def test_runs_in_root(self, executor, tmp_project):
+        assert executor._run_ac(2, ["test -f CLAUDE.md"]) is None
+
+    def test_emits_ac_result_per_command(self, executor):
+        executor._run_ac(2, ["true", "false"])
+        events = [json.loads(l) for l in executor._events_file.read_text().splitlines()]
+        ac = [e for e in events if e["event"] == "ac_result"]
+        assert [e["exit_code"] for e in ac] == [0, 1]
+        assert ac[0]["cmd"] == "true"
+
+    def test_timeout_is_failure(self, executor):
+        executor.AC_TIMEOUT = 1
+        err = executor._run_ac(2, ["sleep 5"])
+        assert err is not None and "timeout" in err
+
+
+# ---------------------------------------------------------------------------
+# _execute_single_step 판정 — AC 결과가 세션 자기 신고보다 우선
+# ---------------------------------------------------------------------------
+
+class TestVerdict:
+    """_invoke_claude를 '세션이 index.json에 status를 쓰는' 가짜로 바꿔 판정 로직만 검증."""
+
+    def _fake_session(self, executor, status, **extra):
+        calls = []
+        def fake_invoke(step, preamble):
+            calls.append(preamble)
+            idx = executor._read_json(executor._index_file)
+            for s in idx["steps"]:
+                if s["step"] == step["step"]:
+                    s["status"] = status
+                    s.update(extra)
+            executor._write_json(executor._index_file, idx)
+            return {}
+        executor._invoke_claude = fake_invoke
+        executor._commit_step = lambda *a: None
+        executor._update_top_index = lambda *a: None
+        return calls
+
+    def _status(self, executor, n=2):
+        return next(s for s in executor._read_json(executor._index_file)["steps"] if s["step"] == n)
+
+    def test_ac_pass_and_session_completed(self, executor):
+        self._fake_session(executor, "completed", summary="done")
+        assert executor._execute_single_step({"step": 2, "name": "ui", "ac": ["true"]}) is True
+        assert self._status(executor)["status"] == "completed"
+
+    def test_ac_pass_overrides_session_error(self, executor, capsys):
+        self._fake_session(executor, "error", error_message="i gave up")
+        assert executor._execute_single_step({"step": 2, "name": "ui", "ac": ["true"]}) is True
+        st = self._status(executor)
+        assert st["status"] == "completed"
+        assert "error_message" not in st
+        assert "판정 불일치" in capsys.readouterr().out
+
+    def test_ac_fail_overrides_session_completed_and_feeds_error_back(self, executor):
+        calls = self._fake_session(executor, "completed", summary="lie")
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui", "ac": ["echo nope >&2; exit 1"]})
+        assert e.value.code == 1
+        assert len(calls) == ex.StepExecutor.MAX_RETRIES
+        # 2회차부터는 AC 출력이 prev_error로 프롬프트에 들어간다
+        assert "이전 시도 실패" in calls[1] and "nope" in calls[1]
+        st = self._status(executor)
+        assert st["status"] == "error"
+        assert "AC 실패" in st["error_message"]
+
+    def test_no_ac_trusts_session_completed(self, executor, capsys):
+        self._fake_session(executor, "completed", summary="ok")
+        assert executor._execute_single_step({"step": 2, "name": "ui"}) is True
+        assert "AC 미선언" in capsys.readouterr().out
+
+    def test_no_ac_session_error_retries_then_fails(self, executor):
+        calls = self._fake_session(executor, "error", error_message="boom")
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui"})
+        assert e.value.code == 1
+        assert len(calls) == ex.StepExecutor.MAX_RETRIES
+
+    def test_blocked_stops_before_ac(self, executor, tmp_project):
+        self._fake_session(executor, "blocked", blocked_reason="need API key")
+        marker = tmp_project / "ac-ran"
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui", "ac": [f"touch {marker}"]})
+        assert e.value.code == 2
+        assert not marker.exists()
+
+    def test_ac_taken_from_step_dict_not_index(self, executor):
+        """세션이 index.json에서 ac를 지워도 executor는 호출 전 step dict의 ac로 판정한다."""
+        def fake_invoke(step, preamble):
+            idx = executor._read_json(executor._index_file)
+            for s in idx["steps"]:
+                if s["step"] == 2:
+                    s["status"] = "completed"
+                    s.pop("ac", None)
+            executor._write_json(executor._index_file, idx)
+        executor._invoke_claude = fake_invoke
+        executor._commit_step = lambda *a: None
+        executor._update_top_index = lambda *a: None
+        with pytest.raises(SystemExit):
+            executor._execute_single_step({"step": 2, "name": "ui", "ac": ["false"]})
+
+
 # ---------------------------------------------------------------------------
 # progress_indicator (= 이전 Spinner)
 # ---------------------------------------------------------------------------
@@ -513,6 +719,79 @@ class TestMainCli:
                 with pytest.raises(SystemExit) as exc_info:
                     ex.main()
                 assert exc_info.value.code == 1
+
+    def test_status_prints_steps_without_side_effects(self, tmp_project, phase_dir, capsys):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--status"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run") as run:
+            ex.main()
+        out = capsys.readouterr().out
+        assert "setup" in out and "core" in out and "ui" in out
+        assert "completed" in out and "pending" in out
+        run.assert_not_called()
+
+    def test_dry_run_does_not_call_claude_or_git(self, tmp_project, phase_dir, capsys):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2]["docs"] = ["docs/arch.md", "docs/missing.md"]
+        idx["steps"][2]["ac"] = ["npm test"]
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run") as run:
+            ex.main()
+        out = capsys.readouterr().out
+        assert "Step 2: ui" in out
+        assert "doc ✓ docs/arch.md" in out
+        assert "doc ✗ docs/missing.md" in out
+        assert "ac  npm test" in out
+        assert "prompt" in out
+        run.assert_not_called()
+        assert not (phase_dir / "step2-output.json").exists()
+
+    def test_retry_resets_error_step(self, tmp_project, phase_dir, top_index):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2].update({"status": "error", "error_message": "boom", "failed_at": "t"})
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--retry", "2", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run"):
+            ex.main()
+        st = json.loads((phase_dir / "index.json").read_text())["steps"][2]
+        assert st["status"] == "pending"
+        assert "error_message" not in st and "failed_at" not in st
+        top = json.loads(top_index.read_text())
+        assert next(p for p in top["phases"] if p["dir"] == "0-mvp")["status"] == "pending"
+
+    def test_retry_resets_blocked_step(self, tmp_project, phase_dir):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2].update({"status": "blocked", "blocked_reason": "key", "blocked_at": "t"})
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--retry", "2", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run"):
+            ex.main()
+        st = json.loads((phase_dir / "index.json").read_text())["steps"][2]
+        assert st["status"] == "pending" and "blocked_reason" not in st
+
+    def test_retry_refuses_non_failed_step(self, tmp_project, phase_dir):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--retry", "0"]), \
+             patch.object(ex, "ROOT", tmp_project):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.main()
+            assert exc_info.value.code == 1
+        st = json.loads((phase_dir / "index.json").read_text())["steps"][0]
+        assert st["status"] == "completed"
+
+    def test_dry_run_exits_on_error_step_with_retry_hint(self, tmp_project, phase_dir, capsys):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2].update({"status": "error", "error_message": "boom"})
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.main()
+            assert exc_info.value.code == 1
+        assert "--retry 2" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

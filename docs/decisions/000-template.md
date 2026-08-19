@@ -1,0 +1,13 @@
+# ADR-000: {결정 사항 (예: Next.js App Router 선택)}
+
+**상태**: accepted | superseded by NNN
+**날짜**: {YYYY-MM-DD}
+
+## 결정
+{뭘 선택했는지}
+
+## 이유
+{왜 선택했는지}
+
+## 트레이드오프
+{뭘 포기했는지}
