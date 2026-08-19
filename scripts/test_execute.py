@@ -720,6 +720,79 @@ class TestMainCli:
                     ex.main()
                 assert exc_info.value.code == 1
 
+    def test_status_prints_steps_without_side_effects(self, tmp_project, phase_dir, capsys):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--status"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run") as run:
+            ex.main()
+        out = capsys.readouterr().out
+        assert "setup" in out and "core" in out and "ui" in out
+        assert "completed" in out and "pending" in out
+        run.assert_not_called()
+
+    def test_dry_run_does_not_call_claude_or_git(self, tmp_project, phase_dir, capsys):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2]["docs"] = ["docs/arch.md", "docs/missing.md"]
+        idx["steps"][2]["ac"] = ["npm test"]
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run") as run:
+            ex.main()
+        out = capsys.readouterr().out
+        assert "Step 2: ui" in out
+        assert "doc ✓ docs/arch.md" in out
+        assert "doc ✗ docs/missing.md" in out
+        assert "ac  npm test" in out
+        assert "prompt" in out
+        run.assert_not_called()
+        assert not (phase_dir / "step2-output.json").exists()
+
+    def test_retry_resets_error_step(self, tmp_project, phase_dir, top_index):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2].update({"status": "error", "error_message": "boom", "failed_at": "t"})
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--retry", "2", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run"):
+            ex.main()
+        st = json.loads((phase_dir / "index.json").read_text())["steps"][2]
+        assert st["status"] == "pending"
+        assert "error_message" not in st and "failed_at" not in st
+        top = json.loads(top_index.read_text())
+        assert next(p for p in top["phases"] if p["dir"] == "0-mvp")["status"] == "pending"
+
+    def test_retry_resets_blocked_step(self, tmp_project, phase_dir):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2].update({"status": "blocked", "blocked_reason": "key", "blocked_at": "t"})
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--retry", "2", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project), \
+             patch.object(ex.subprocess, "run"):
+            ex.main()
+        st = json.loads((phase_dir / "index.json").read_text())["steps"][2]
+        assert st["status"] == "pending" and "blocked_reason" not in st
+
+    def test_retry_refuses_non_failed_step(self, tmp_project, phase_dir):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--retry", "0"]), \
+             patch.object(ex, "ROOT", tmp_project):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.main()
+            assert exc_info.value.code == 1
+        st = json.loads((phase_dir / "index.json").read_text())["steps"][0]
+        assert st["status"] == "completed"
+
+    def test_dry_run_exits_on_error_step_with_retry_hint(self, tmp_project, phase_dir, capsys):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][2].update({"status": "error", "error_message": "boom"})
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with patch("sys.argv", ["execute.py", "0-mvp", "--dry-run"]), \
+             patch.object(ex, "ROOT", tmp_project):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.main()
+            assert exc_info.value.code == 1
+        assert "--retry 2" in capsys.readouterr().out
+
 
 # ---------------------------------------------------------------------------
 # _check_blockers (= 이전 main() error/blocked 체크)

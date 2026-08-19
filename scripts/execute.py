@@ -3,7 +3,10 @@
 Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
 
 Usage:
-    python3 scripts/execute.py <phase-dir> [--push]
+    python3 scripts/execute.py <phase-dir> [--push]        # 순차 실행
+    python3 scripts/execute.py <phase-dir> --status        # 진행 현황
+    python3 scripts/execute.py <phase-dir> --dry-run       # 주입 문서·AC·프롬프트 크기만 출력 (claude/git 미호출)
+    python3 scripts/execute.py <phase-dir> --retry N       # error/blocked step N을 pending으로 되돌리고 이어서 실행
 """
 
 import argparse
@@ -90,6 +93,68 @@ class StepExecutor:
         self._emit("phase_start", total_steps=self._total)
         self._execute_all_steps()
         self._finalize()
+
+    STATUS_ICON = {"completed": "✓", "error": "✗", "blocked": "⏸", "pending": "·"}
+
+    def status(self):
+        """phase 진행 현황을 출력한다. git·claude 호출 없음."""
+        index = self._read_json(self._index_file)
+        print(f"\nPhase: {self._phase_name} ({self._phase_dir_name})"
+              f"  created: {index.get('created_at', '-')}  completed: {index.get('completed_at', '-')}")
+        for s in index["steps"]:
+            icon = self.STATUS_ICON.get(s["status"], "?")
+            ts = s.get("completed_at") or s.get("failed_at") or s.get("blocked_at") or s.get("started_at") or ""
+            print(f"  {icon} {s['step']:>2}  {s['name']:<20} {s['status']:<10} {ts}")
+            detail = s.get("error_message") or s.get("blocked_reason") or s.get("summary")
+            if detail:
+                print(f"         {detail[:120]}")
+        print()
+
+    def retry(self, step_num: int):
+        """error/blocked 상태의 step을 pending으로 되돌린다. 이어서 run()이 그 step부터 실행한다."""
+        index = self._read_json(self._index_file)
+        step = next((s for s in index["steps"] if s["step"] == step_num), None)
+        if step is None:
+            print(f"ERROR: step {step_num} not found")
+            sys.exit(1)
+        if step["status"] not in ("error", "blocked"):
+            print(f"ERROR: step {step_num} is '{step['status']}' — error/blocked 상태만 --retry 할 수 있다")
+            sys.exit(1)
+        prev = step["status"]
+        step["status"] = "pending"
+        for k in ("error_message", "blocked_reason", "failed_at", "blocked_at"):
+            step.pop(k, None)
+        self._write_json(self._index_file, index)
+        self._update_top_index("pending")
+        self._emit("step_reset", step=step_num, from_status=prev)
+        print(f"  ↺ Step {step_num} ({step['name']}): {prev} → pending")
+
+    def dry_run(self):
+        """claude·git 호출 없이, pending step마다 무엇이 주입되고 무엇으로 판정하는지 보여준다."""
+        self._print_header()
+        self._check_blockers()
+        index = self._read_json(self._index_file)
+        pending = [s for s in index["steps"] if s["status"] == "pending"]
+        print(f"  [dry-run] 실행 예정 step: {len(pending)}개 (branch: feat-{self._phase_name})\n")
+        for step in pending:
+            print(f"  Step {step['step']}: {step['name']}")
+            for rel in self.ALWAYS_DOCS:
+                print(f"    doc {'✓' if (ROOT / rel).exists() else '✗'} {rel} (항상)")
+            for rel in step.get("docs", []):
+                print(f"    doc {'✓' if (ROOT / rel).exists() else '✗'} {rel}")
+            ac = step.get("ac") or []
+            for cmd in ac:
+                print(f"    ac  {cmd}")
+            if not ac:
+                print("    ac  (미선언 — 세션 자기 신고로 판정)")
+            step_file = self._phase_dir / f"step{step['step']}.md"
+            if step_file.exists():
+                guardrails = self._load_guardrails(step)
+                prompt = self._build_preamble(guardrails, self._build_step_context(index), ac=ac) + step_file.read_text()
+                print(f"    prompt {len(prompt):,} chars")
+            else:
+                print(f"    step file ✗ {step_file.name}")
+            print()
 
     # --- timestamps ---
 
@@ -329,12 +394,12 @@ class StepExecutor:
             if s["status"] == "error":
                 print(f"\n  ✗ Step {s['step']} ({s['name']}) failed.")
                 print(f"  Error: {s.get('error_message', 'unknown')}")
-                print(f"  Fix and reset status to 'pending' to retry.")
+                print(f"  Fix, then: python3 scripts/execute.py {self._phase_dir_name} --retry {s['step']}")
                 sys.exit(1)
             if s["status"] == "blocked":
                 print(f"\n  ⏸ Step {s['step']} ({s['name']}) blocked.")
                 print(f"  Reason: {s.get('blocked_reason', 'unknown')}")
-                print(f"  Resolve and reset status to 'pending' to retry.")
+                print(f"  Resolve, then: python3 scripts/execute.py {self._phase_dir_name} --retry {s['step']}")
                 sys.exit(2)
             if s["status"] != "pending":
                 break
@@ -496,9 +561,21 @@ def main():
     parser = argparse.ArgumentParser(description="Harness Step Executor")
     parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
     parser.add_argument("--push", action="store_true", help="Push branch after completion")
+    parser.add_argument("--status", action="store_true", help="Show phase progress and exit")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would run (docs, AC, prompt size) without calling claude/git")
+    parser.add_argument("--retry", type=int, metavar="N", help="Reset error/blocked step N to pending, then continue")
     args = parser.parse_args()
 
-    StepExecutor(args.phase_dir, auto_push=args.push).run()
+    executor = StepExecutor(args.phase_dir, auto_push=args.push)
+    if args.status:
+        executor.status()
+        return
+    if args.retry is not None:
+        executor.retry(args.retry)
+    if args.dry_run:
+        executor.dry_run()
+        return
+    executor.run()
 
 
 if __name__ == "__main__":
