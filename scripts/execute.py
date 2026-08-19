@@ -64,6 +64,7 @@ class StepExecutor:
         self._phase_dir = self._phases_dir / phase_dir_name
         self._phase_dir_name = phase_dir_name
         self._top_index_file = self._phases_dir / "index.json"
+        self._events_file = ROOT / ".dev" / "runs" / phase_dir_name / "events.jsonl"
         self._auto_push = auto_push
 
         if not self._phase_dir.is_dir():
@@ -85,6 +86,7 @@ class StepExecutor:
         self._check_blockers()
         self._checkout_branch()
         self._ensure_created_at()
+        self._emit("phase_start", total_steps=self._total)
         self._execute_all_steps()
         self._finalize()
 
@@ -102,6 +104,15 @@ class StepExecutor:
     @staticmethod
     def _write_json(p: Path, data: dict):
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # --- 이벤트 로그 (.dev/runs/{phase}/events.jsonl) ---
+
+    def _emit(self, event: str, **fields):
+        """기계 판독용 JSON line 1개를 append한다. 사람용 출력은 print가 담당한다."""
+        record = {"ts": self._stamp(), "phase": self._phase_name, "event": event, **fields}
+        self._events_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # --- git ---
 
@@ -254,12 +265,26 @@ class StepExecutor:
             "step": step_num, "name": step_name,
             "exitCode": result.returncode,
             "stdout": result.stdout, "stderr": result.stderr,
+            "parsed": self._parse_claude_output(result.stdout),
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
+        self._emit("claude_done", step=step_num, exit_code=result.returncode, **(output["parsed"] or {}))
         return output
+
+    @staticmethod
+    def _parse_claude_output(stdout: str) -> Optional[dict]:
+        """`claude --output-format json` 결과에서 비용/턴/시간 필드만 추출. JSON이 아니면 None."""
+        try:
+            data = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        keys = ("duration_ms", "num_turns", "total_cost_usd", "is_error", "session_id")
+        return {k: data[k] for k in keys if k in data}
 
     # --- 헤더 & 검증 ---
 
@@ -325,6 +350,7 @@ class StepExecutor:
                         s["completed_at"] = ts
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
+                self._emit("step_completed", step=step_num, attempt=attempt, elapsed_s=elapsed)
                 print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
                 return True
 
@@ -336,6 +362,7 @@ class StepExecutor:
                 reason = next((s.get("blocked_reason", "") for s in index["steps"] if s["step"] == step_num), "")
                 print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
                 print(f"    Reason: {reason}")
+                self._emit("step_blocked", step=step_num, attempt=attempt, reason=reason)
                 self._update_top_index("blocked")
                 sys.exit(2)
 
@@ -351,6 +378,7 @@ class StepExecutor:
                         s.pop("error_message", None)
                 self._write_json(self._index_file, index)
                 prev_error = err_msg
+                self._emit("step_retry", step=step_num, attempt=attempt, error=err_msg)
                 print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
             else:
                 for s in index["steps"]:
@@ -362,6 +390,7 @@ class StepExecutor:
                 self._commit_step(step_num, step_name)
                 print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
                 print(f"    Error: {err_msg}")
+                self._emit("step_failed", step=step_num, attempt=attempt, error=err_msg)
                 self._update_top_index("error")
                 sys.exit(1)
 
@@ -382,6 +411,7 @@ class StepExecutor:
                     self._write_json(self._index_file, index)
                     break
 
+            self._emit("step_start", step=step_num, name=pending["name"])
             self._execute_single_step(pending)
 
     def _finalize(self):
@@ -389,6 +419,7 @@ class StepExecutor:
         index["completed_at"] = self._stamp()
         self._write_json(self._index_file, index)
         self._update_top_index("completed")
+        self._emit("phase_completed")
 
         self._run_git("add", "-A")
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:

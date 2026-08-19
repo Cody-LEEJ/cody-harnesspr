@@ -86,6 +86,7 @@ def executor(tmp_project, phase_dir):
     inst._phase_dir_name = "0-mvp"
     inst._index_file = phase_dir / "index.json"
     inst._top_index_file = tmp_project / "phases" / "index.json"
+    inst._events_file = tmp_project / ".dev" / "runs" / "0-mvp" / "events.jsonl"
     return inst
 
 
@@ -476,6 +477,69 @@ class TestInvokeClaude:
             executor._invoke_claude(step, "preamble")
 
         assert mock_run.call_args[1]["timeout"] == 1800
+
+
+    def test_saves_parsed_fields_from_json_stdout(self, executor):
+        stdout = json.dumps({"type": "result", "duration_ms": 1234, "num_turns": 5,
+                             "total_cost_usd": 0.12, "is_error": False, "session_id": "abc",
+                             "result": "done"})
+        mock_result = MagicMock(returncode=0, stdout=stdout, stderr="")
+        with patch("subprocess.run", return_value=mock_result):
+            output = executor._invoke_claude({"step": 2, "name": "ui"}, "p")
+        assert output["parsed"] == {"duration_ms": 1234, "num_turns": 5, "total_cost_usd": 0.12,
+                                    "is_error": False, "session_id": "abc"}
+        assert output["stdout"] == stdout  # 원문 유지
+
+    def test_parsed_is_none_for_non_json(self, executor):
+        mock_result = MagicMock(returncode=1, stdout="not json at all", stderr="")
+        with patch("subprocess.run", return_value=mock_result):
+            output = executor._invoke_claude({"step": 2, "name": "ui"}, "p")
+        assert output["parsed"] is None
+
+    def test_emits_claude_done_event(self, executor):
+        mock_result = MagicMock(returncode=0, stdout='{"num_turns": 3}', stderr="")
+        with patch("subprocess.run", return_value=mock_result):
+            executor._invoke_claude({"step": 2, "name": "ui"}, "p")
+        events = [json.loads(l) for l in executor._events_file.read_text().splitlines()]
+        assert events[-1]["event"] == "claude_done"
+        assert events[-1]["step"] == 2
+        assert events[-1]["num_turns"] == 3
+
+
+# ---------------------------------------------------------------------------
+# _emit / _parse_claude_output
+# ---------------------------------------------------------------------------
+
+class TestEmit:
+    def test_appends_valid_json_lines(self, executor):
+        executor._emit("a", step=1)
+        executor._emit("b", step=2, error="x")
+        lines = executor._events_file.read_text().splitlines()
+        assert len(lines) == 2
+        a, b = (json.loads(l) for l in lines)
+        assert a["event"] == "a" and a["step"] == 1 and a["phase"] == "mvp" and "ts" in a
+        assert b["event"] == "b" and b["error"] == "x"
+
+    def test_creates_parent_dirs(self, executor):
+        assert not executor._events_file.parent.exists()
+        executor._emit("x")
+        assert executor._events_file.exists()
+
+    def test_korean_not_escaped(self, executor):
+        executor._emit("x", error="한글")
+        assert "한글" in executor._events_file.read_text()
+
+
+class TestParseClaudeOutput:
+    def test_extracts_known_keys_only(self):
+        out = ex.StepExecutor._parse_claude_output('{"duration_ms": 1, "result": "long text", "extra": 1}')
+        assert out == {"duration_ms": 1}
+
+    def test_non_json_returns_none(self):
+        assert ex.StepExecutor._parse_claude_output("oops") is None
+
+    def test_json_array_returns_none(self):
+        assert ex.StepExecutor._parse_claude_output("[1,2]") is None
 
 
 # ---------------------------------------------------------------------------
