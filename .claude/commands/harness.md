@@ -6,7 +6,9 @@
 
 ### A. 탐색
 
-`/docs/` 하위 문서(PRD, ARCHITECTURE, ADR 등)를 읽고 프로젝트의 기획·아키텍처·설계 의도를 파악한다. 필요시 Explore 에이전트를 병렬로 사용한다.
+`/docs/` 하위 문서(PRD, ARCHITECTURE, ADR, GOLDEN_RULES 등)를 읽고 프로젝트의 기획·아키텍처·설계 의도를 파악한다. 필요시 Explore 에이전트를 병렬로 사용한다.
+
+문서 최상단에 `⚠ TEMPLATE` 배너가 남아 있으면 그 문서는 아직 채워지지 않은 것이다. 플레이스홀더를 규칙으로 받아들이지 말고, 사용자에게 먼저 채우도록 요청하라.
 
 ### B. 논의
 
@@ -22,9 +24,10 @@
 2. **자기완결성** — 각 step 파일은 독립된 Claude 세션에서 실행된다. "이전 대화에서 논의한 바와 같이" 같은 외부 참조는 금지한다. 필요한 정보는 전부 파일 안에 적는다.
 3. **사전 준비 강제** — 관련 문서 경로와 이전 step에서 생성/수정된 파일 경로를 명시한다. 세션이 코드를 읽고 맥락을 파악한 뒤 작업하도록 유도한다.
 4. **시그니처 수준 지시** — 함수/클래스의 인터페이스만 제시하고 내부 구현은 에이전트 재량에 맡긴다. 단, 설계 의도에서 벗어나면 안 되는 핵심 규칙(멱등성, 보안, 데이터 무결성 등)은 반드시 명시한다.
-5. **AC는 실행 가능한 커맨드** — "~가 동작해야 한다" 같은 추상적 서술이 아닌 `npm run build && npm test` 같은 실제 실행 가능한 검증 커맨드를 포함한다.
+5. **AC는 실행 가능한 커맨드** — "~가 동작해야 한다" 같은 추상적 서술이 아닌 `npm run build`, `npm test` 같은 실제 실행 가능한 검증 커맨드로 적는다. AC는 `index.json`의 `ac` 배열에 선언하며, **세션 종료 후 execute.py가 직접 실행해 통과/실패를 판정한다.** 세션의 자기 신고는 판정 근거가 아니다.
 6. **주의사항은 구체적으로** — "조심해라" 대신 "X를 하지 마라. 이유: Y" 형식으로 적는다.
 7. **네이밍** — step name은 kebab-case slug로, 해당 step의 핵심 모듈/작업을 한두 단어로 표현한다 (예: `project-setup`, `api-layer`, `auth-flow`).
+8. **컨텍스트는 선택적으로** — 각 step이 실제로 필요로 하는 문서만 `docs` 배열에 선언한다. 백엔드 step에 UI_GUIDE를 넣지 않는다. CLAUDE.md와 GOLDEN_RULES.md는 항상 자동 주입되므로 선언하지 않는다.
 
 ### D. 파일 생성
 
@@ -56,9 +59,15 @@
   "project": "<프로젝트명>",
   "phase": "<task-name>",
   "steps": [
-    { "step": 0, "name": "project-setup", "status": "pending" },
-    { "step": 1, "name": "core-types", "status": "pending" },
-    { "step": 2, "name": "api-layer", "status": "pending" }
+    { "step": 0, "name": "project-setup", "status": "pending",
+      "docs": ["docs/ARCHITECTURE.md"],
+      "ac": ["npm run build"] },
+    { "step": 1, "name": "core-types", "status": "pending",
+      "docs": ["docs/ARCHITECTURE.md", "docs/decisions/001-app-router.md"],
+      "ac": ["npm run build", "npm test"] },
+    { "step": 2, "name": "api-layer", "status": "pending",
+      "docs": ["docs/ARCHITECTURE.md"],
+      "ac": ["npm run build", "npm test"] }
   ]
 }
 ```
@@ -70,6 +79,8 @@
 - `steps[].step`: 0부터 시작하는 순번.
 - `steps[].name`: kebab-case slug.
 - `steps[].status`: 초기값은 모두 `"pending"`.
+- `steps[].docs`: 이 step 프롬프트에 **전문 주입**할 문서 경로(리포 루트 기준). CLAUDE.md·GOLDEN_RULES.md는 항상 주입되므로 적지 않는다. 필요한 것만 적는다.
+- `steps[].ac`: 이 step의 Acceptance Criteria 커맨드 배열. execute.py가 세션 종료 후 **리포 루트에서 순서대로 직접 실행**하며, 하나라도 exit code ≠ 0이면 실패로 판정하고 그 출력을 다음 시도 프롬프트에 넣는다. 비워 두면 세션 자기 신고로 판정한다 (경고 출력). 가능한 한 비우지 마라.
 
 상태 전이와 자동 기록 필드:
 
@@ -90,10 +101,8 @@
 
 ## 읽어야 할 파일
 
-먼저 아래 파일들을 읽고 프로젝트의 아키텍처와 설계 의도를 파악하라:
+문서는 index.json의 `docs`로 프롬프트에 이미 주입되어 있다. 여기에는 **코드 파일**만 적는다.
 
-- `/docs/ARCHITECTURE.md`
-- `/docs/ADR.md`
 - {이전 step에서 생성/수정된 파일 경로}
 
 이전 step에서 만들어진 코드를 꼼꼼히 읽고, 설계 의도를 이해한 뒤 작업하라.
@@ -106,20 +115,17 @@
 
 ## Acceptance Criteria
 
-```bash
-npm run build   # 컴파일 에러 없음
-npm test        # 테스트 통과
-```
+AC 커맨드는 `index.json`의 `ac` 배열에 선언되어 있고 프롬프트 상단 "작업 규칙"에 나열된다. 세션 종료 후 execute.py가 같은 커맨드를 독립 실행해 판정한다.
 
 ## 검증 절차
 
-1. 위 AC 커맨드를 실행한다.
+1. 프롬프트에 나열된 AC 커맨드를 직접 실행해 전부 통과시킨다.
 2. 아키텍처 체크리스트를 확인한다:
+   - GOLDEN_RULES.md를 위반하지 않았는가?
    - ARCHITECTURE.md 디렉토리 구조를 따르는가?
    - ADR 기술 스택을 벗어나지 않았는가?
-   - CLAUDE.md CRITICAL 규칙을 위반하지 않았는가?
 3. 결과에 따라 `phases/{task-name}/index.json`의 해당 step을 업데이트한다:
-   - 성공 → `"status": "completed"`, `"summary": "산출물 한 줄 요약"`
+   - 성공 → `"status": "completed"`, `"summary": "산출물 한 줄 요약"` (summary는 다음 step의 컨텍스트가 된다 — 반드시 적어라)
    - 수정 3회 시도 후에도 실패 → `"status": "error"`, `"error_message": "구체적 에러 내용"`
    - 사용자 개입 필요 (API 키, 외부 인증, 수동 설정 등) → `"status": "blocked"`, `"blocked_reason": "구체적 사유"` 후 즉시 중단
 
@@ -132,20 +138,33 @@ npm test        # 테스트 통과
 ### E. 실행
 
 ```bash
-python3 scripts/execute.py {task-name}        # 순차 실행
-python3 scripts/execute.py {task-name} --push  # 실행 후 push
+python3 scripts/execute.py {task-name} --dry-run   # 먼저: 주입 문서·AC·프롬프트 크기 확인 (claude/git 미호출)
+python3 scripts/execute.py {task-name}             # 순차 실행
+python3 scripts/execute.py {task-name} --push      # 실행 후 push
+python3 scripts/execute.py {task-name} --status    # 진행 현황
 ```
 
 execute.py가 자동으로 처리하는 것:
 
 - `feat-{task-name}` 브랜치 생성/checkout
-- 가드레일 주입 — CLAUDE.md + docs/*.md 내용을 매 step 프롬프트에 포함
+- 가드레일 주입 — CLAUDE.md + docs/GOLDEN_RULES.md는 항상, 그 외 문서는 step의 `docs`에 선언한 것만 프롬프트에 포함
 - 컨텍스트 누적 — 완료된 step의 summary를 다음 step 프롬프트에 전달
-- 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
+- **AC 독립 판정** — 세션 종료 후 step의 `ac` 커맨드를 executor가 직접 실행. 통과하면 completed(세션이 뭐라 했든), 실패하면 그 출력을 다음 시도에 피드백. 세션 신고와 불일치하면 로그에 남긴다
+- 자가 교정 — 실패 시 최대 3회 재시도하며, AC 출력(또는 세션의 error_message)을 프롬프트에 피드백
 - 2단계 커밋 — 코드 변경(`feat`)과 메타데이터(`chore`)를 분리 커밋
 - 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
+- 이벤트 로그 — `.dev/runs/{task-name}/events.jsonl`에 step_start/claude_done/ac_result/verdict/step_retry/step_completed 등을 JSON line으로 기록 (`/retro`의 입력)
 
 에러 복구:
 
-- **error 발생 시**: `phases/{task-name}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
-- **blocked 발생 시**: `blocked_reason`에 적힌 사유를 해결한 뒤, `status`를 `"pending"`으로 바꾸고 `blocked_reason`을 삭제한 뒤 재실행한다.
+```bash
+python3 scripts/execute.py {task-name} --retry N   # error/blocked step N을 pending으로 되돌리고 이어서 실행
+```
+
+- **error 발생 시**: `error_message`(보통 AC 출력)를 보고 원인이 step 설계에 있으면 `step{N}.md`·`ac`를 고친 뒤 `--retry N`.
+- **blocked 발생 시**: `blocked_reason`에 적힌 사유(API 키, 인증 등)를 해결한 뒤 `--retry N`.
+
+### F. phase 종료 후
+
+1. `/review` — 변경 전체를 GOLDEN_RULES·ARCHITECTURE·ADR 기준으로 2차 검토
+2. `/retro` — `events.jsonl`과 `index.json`에서 반복 실패 패턴을 `.dev/lessons.md`에 기록. 3회 반복된 패턴은 GOLDEN_RULES 승격 제안
